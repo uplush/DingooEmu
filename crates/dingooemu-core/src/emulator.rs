@@ -1110,7 +1110,7 @@ impl Emulator {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn read_guest_w_string(&self, ptr: u32) -> String {
+    fn read_guest_w_string_words(&self, ptr: u32) -> Vec<u16> {
         let mut words = Vec::new();
         let mut offset = 0u32;
         while let Ok(w) = self.memory.read_u16(ptr.wrapping_add(offset)) {
@@ -1123,7 +1123,11 @@ impl Emulator {
                 break;
             }
         }
-        String::from_utf16_lossy(&words)
+        words
+    }
+
+    fn read_guest_w_string(&self, ptr: u32) -> String {
+        String::from_utf16_lossy(&self.read_guest_w_string_words(ptr))
     }
 
     fn guest_printf_arg(&self, index: usize) -> Result<u32> {

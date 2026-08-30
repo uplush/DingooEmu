@@ -1,6 +1,10 @@
 use super::{Emulator, HandlerResult};
 use crate::error::Result;
 
+fn is_firmware_return_request(name_words: &[u16], mode: &str) -> bool {
+    mode == "rb" && (name_words == [0xDE88, 0x80AA] || name_words == [0x88C0, 0x80AD])
+}
+
 pub(super) fn handle(emu: &mut Emulator, func_name: &str) -> Result<HandlerResult> {
     match func_name {
         "get_dl_handle" => {
@@ -48,9 +52,19 @@ pub(super) fn handle(emu: &mut Emulator, func_name: &str) -> Result<HandlerResul
             log::trace!("  {func_name}({name}, {mode}) = {handle}");
         }
         "fsys_fopenW" => {
-            let name = emu.read_guest_w_string(emu.cpu.regs.read(4));
+            let name_ptr = emu.cpu.regs.read(4);
+            let name_words = emu.read_guest_w_string_words(name_ptr);
+            let name = String::from_utf16_lossy(&name_words);
             let mode = emu.read_guest_w_string(emu.cpu.regs.read(5));
             log::trace!("  fsys_fopenW({name}, {mode})");
+
+            if is_firmware_return_request(&name_words, &mode) {
+                log::info!("Dingoo firmware return request detected; stopping content");
+                emu.cpu.regs.write(2, 0);
+                emu.cpu.stop();
+                return Ok(HandlerResult::Complete);
+            }
+
             let handle = emu.open_guest_file(&name, &mode);
             emu.cpu.regs.write(2, handle);
         }
@@ -129,4 +143,19 @@ pub(super) fn handle(emu: &mut Emulator, func_name: &str) -> Result<HandlerResul
         _ => return Ok(HandlerResult::NotHandled),
     }
     Ok(HandlerResult::Complete)
+}
+#[cfg(test)]
+mod tests {
+    use super::is_firmware_return_request;
+
+    #[test]
+    fn recognizes_observed_firmware_return_sentinels() {
+        assert!(is_firmware_return_request(&[0xDE88, 0x80AA], "rb"));
+        assert!(is_firmware_return_request(&[0x88C0, 0x80AD], "rb"));
+
+        assert!(!is_firmware_return_request(&[0xDE88, 0x80AA], "wb"));
+        assert!(!is_firmware_return_request(&[0x88C0, 0x80AD], "r"));
+        assert!(!is_firmware_return_request(&[0xDE88, 0x80AA, 0x0001], "rb"));
+        assert!(!is_firmware_return_request(&[b'a' as u16], "rb"));
+    }
 }
