@@ -3,6 +3,9 @@ use crate::audio::{Audio, AudioConfig};
 use crate::cheats::{CheatManager, CheatParseError, CheatRule};
 use crate::cpu::Cpu;
 use crate::error::{Result, SimulatorError};
+use crate::game_enhancements::{
+    apply_frame_rate_enhancement, frame_rate_enhancement_profile, FrameRateEnhancementProfile,
+};
 use crate::input::Input;
 #[cfg(feature = "jit")]
 use crate::jit::JitEngine;
@@ -309,6 +312,10 @@ pub struct Emulator {
     locale_ansi_buffer: Option<u32>,
     /// Whether the guest submitted a framebuffer this tick
     framebuffer_submitted: bool,
+    /// Exact-content profile selected for the loaded game, if supported
+    frame_rate_enhancement_profile: Option<&'static FrameRateEnhancementProfile>,
+    /// Whether the selected profile is active for this session
+    frame_rate_enhancement_active: bool,
 }
 
 impl Emulator {
@@ -326,6 +333,7 @@ impl Emulator {
 
     fn from_app_with_path(app: AppImage, app_path: String) -> Result<Self> {
         let mut memory = Memory::new();
+        let frame_rate_enhancement_profile = frame_rate_enhancement_profile(&app);
 
         // Load executable into memory at the load base address (KSEG0)
         let load_base = app.load_base();
@@ -445,6 +453,8 @@ impl Emulator {
             app_path,
             locale_ansi_buffer: None,
             framebuffer_submitted: false,
+            frame_rate_enhancement_profile,
+            frame_rate_enhancement_active: false,
         })
     }
 
@@ -482,6 +492,43 @@ impl Emulator {
     pub fn start(&mut self) {
         self.cpu.start();
         log::info!("Emulator started");
+    }
+
+    /// Enable a supported game's frame-rate profile before execution starts.
+    /// Changes requested after the guest starts are intentionally ignored so
+    /// CPU timing and patched code remain stable for the whole session.
+    pub fn set_frame_rate_enhancement_enabled(&mut self, enabled: bool) -> Result<()> {
+        if self.is_running() {
+            if enabled != self.frame_rate_enhancement_active {
+                log::warn!("Frame-rate enhancement can only be changed before loading content");
+            }
+            return Ok(());
+        }
+        self.apply_frame_rate_enhancement_state(enabled)
+    }
+
+    fn apply_frame_rate_enhancement_state(&mut self, enabled: bool) -> Result<()> {
+        let Some(profile) = self.frame_rate_enhancement_profile else {
+            self.frame_rate_enhancement_active = false;
+            return Ok(());
+        };
+        apply_frame_rate_enhancement(&mut self.memory, profile, enabled)?;
+        self.frame_rate_enhancement_active = enabled;
+        self.clear_instruction_cache();
+        log::info!(
+            "Frame-rate enhancement {} for {}",
+            if enabled { "enabled" } else { "disabled" },
+            profile.name
+        );
+        Ok(())
+    }
+
+    fn cpu_cycles_per_instruction(&self) -> u64 {
+        self.frame_rate_enhancement_profile
+            .filter(|_| self.frame_rate_enhancement_active)
+            .map_or(CPU_CYCLES_PER_INSTRUCTION, |profile| {
+                profile.cpu_cycles_per_instruction
+            })
     }
 
     /// Configure how unknown SDK HLE calls affect execution.
@@ -572,11 +619,13 @@ impl Emulator {
             .clone()
             .ok_or_else(|| "cannot reset an emulator without a loaded app".to_string())?;
         let was_running = self.is_running();
+        let frame_rate_enhancement_active = self.frame_rate_enhancement_active;
         let mut replacement = Self::from_app_with_path(app, self.app_path.clone())?;
         replacement.save_directory = self.save_directory.clone();
         replacement.cheats = self.cheats.clone();
         replacement.unknown_hle_policy = self.unknown_hle_policy;
         replacement.unknown_hle_allowlist = self.unknown_hle_allowlist.clone();
+        replacement.apply_frame_rate_enhancement_state(frame_rate_enhancement_active)?;
         self.memory.copy_state_from(&replacement.memory);
         std::mem::swap(&mut replacement.memory, &mut self.memory);
         if was_running {
@@ -673,6 +722,7 @@ impl Emulator {
         }
 
         let was_running = state.cpu.is_running();
+        let frame_rate_enhancement_active = self.frame_rate_enhancement_active;
         #[cfg(feature = "standalone")]
         let host_audio_output_enabled = self.audio.host_output_enabled();
         let mut replacement = Self::from_app_with_path(app, self.app_path.clone())?;
@@ -707,6 +757,7 @@ impl Emulator {
         replacement.app_main_args_initialized = state.app_main_args_initialized;
         replacement.locale_ansi_buffer = state.locale_ansi_buffer;
         replacement.framebuffer_submitted = state.framebuffer_submitted;
+        replacement.apply_frame_rate_enhancement_state(frame_rate_enhancement_active)?;
         if was_running {
             replacement.cpu.start();
         }
@@ -784,6 +835,7 @@ impl Emulator {
             return Ok(0);
         }
 
+        let cpu_cycles_per_instruction = self.cpu_cycles_per_instruction();
         let mut executed = 0;
         while executed < cycles {
             if self.cpu.regs.pc == TASK_RETURN_ADDRESS {
@@ -810,8 +862,8 @@ impl Emulator {
             if let Some(func_name) = func_name {
                 log::trace!("SDK hook: PC={:#010x} = {}", pc, func_name);
                 sdk_hle::dispatch(self, pc, &func_name)?;
-                self.cycle_count = self.cycle_count.wrapping_add(CPU_CYCLES_PER_INSTRUCTION);
-                executed += CPU_CYCLES_PER_INSTRUCTION;
+                self.cycle_count = self.cycle_count.wrapping_add(cpu_cycles_per_instruction);
+                executed += cpu_cycles_per_instruction;
                 if self.framebuffer_submitted
                     || self.active_context_waiting()
                     || !self.cpu.is_running()
@@ -820,7 +872,7 @@ impl Emulator {
                 }
             } else {
                 let completed = self.run_cached_instruction_block(pc, cycles - executed)?;
-                let completed_cycles = completed * CPU_CYCLES_PER_INSTRUCTION;
+                let completed_cycles = completed * cpu_cycles_per_instruction;
                 self.cycle_count = self.cycle_count.wrapping_add(completed_cycles);
                 executed += completed_cycles;
             }
@@ -830,7 +882,8 @@ impl Emulator {
 
     fn run_cached_instruction_block(&mut self, start: u32, remaining_cycles: u64) -> Result<u64> {
         self.ensure_instruction_block(start)?;
-        let instruction_limit = (remaining_cycles / CPU_CYCLES_PER_INSTRUCTION) as usize;
+        let cpu_cycles_per_instruction = self.cpu_cycles_per_instruction();
+        let instruction_limit = (remaining_cycles / cpu_cycles_per_instruction) as usize;
         let cache_index = instruction_block_cache_index(start);
 
         #[cfg(feature = "jit")]
@@ -866,7 +919,7 @@ impl Emulator {
                 self.cpu.account_instructions(completed);
                 self.cycle_count = self
                     .cycle_count
-                    .wrapping_add(completed * CPU_CYCLES_PER_INSTRUCTION);
+                    .wrapping_add(completed * cpu_cycles_per_instruction);
             }
             if !step_result? {
                 break;
@@ -1996,6 +2049,8 @@ impl Default for Emulator {
             app_path: String::new(),
             locale_ansi_buffer: None,
             framebuffer_submitted: false,
+            frame_rate_enhancement_profile: None,
+            frame_rate_enhancement_active: false,
         }
     }
 }

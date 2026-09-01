@@ -10,6 +10,7 @@ pub mod cheats;
 pub mod cpu;
 pub mod emulator;
 pub mod error;
+mod game_enhancements;
 pub mod input;
 #[cfg(feature = "jit")]
 mod jit;

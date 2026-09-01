@@ -471,6 +471,7 @@ struct CoreOptions {
     repeat_delay: u32,
     repeat_period: u32,
     swap_ab: bool,
+    frame_rate_enhancement_enabled: bool,
     diagnostics_enabled: bool,
     unknown_instruction_policy: UnknownInstructionPolicy,
     jit_enabled: bool,
@@ -483,6 +484,7 @@ impl Default for CoreOptions {
             repeat_delay: 24,
             repeat_period: 6,
             swap_ab: false,
+            frame_rate_enhancement_enabled: false,
             diagnostics_enabled: false,
             unknown_instruction_policy: UnknownInstructionPolicy::Skip,
             jit_enabled: true,
@@ -525,6 +527,10 @@ fn core_option_variables() -> Vec<RetroVariable> {
     variables.push(RetroVariable {
         key: c"dingooemu_cpu_engine".as_ptr(),
         value: c"CPU Execution Engine; jit|interpreter".as_ptr(),
+    });
+    variables.push(RetroVariable {
+        key: c"dingooemu_frame_rate_enhancement".as_ptr(),
+        value: c"Frame Rate Enhancement; disabled|enabled".as_ptr(),
     });
     variables.push(RetroVariable {
         key: ptr::null(),
@@ -587,6 +593,9 @@ fn read_core_options(mut get: impl FnMut(&CStr) -> Option<String>) -> CoreOption
     if let Some(swap) = get(c"dingooemu_swap_ab") {
         options.swap_ab = swap == "enabled";
     }
+    if let Some(enhancement) = get(c"dingooemu_frame_rate_enhancement") {
+        options.frame_rate_enhancement_enabled = enhancement == "enabled";
+    }
     if let Some(debug) = get(c"dingooemu_debug_logging") {
         options.diagnostics_enabled = debug == "enabled";
     }
@@ -610,6 +619,11 @@ fn apply_core_options(emulator: &mut Emulator) {
         .input
         .set_repeat_timing(options.repeat_delay, options.repeat_period);
     emulator.input.set_swap_ab(options.swap_ab);
+    if let Err(error) =
+        emulator.set_frame_rate_enhancement_enabled(options.frame_rate_enhancement_enabled)
+    {
+        log::error!("Unable to apply frame-rate enhancement: {error}");
+    }
     // Keep performance diagnostics independent of verbose frontend logging.
     crate::logger::set_debug_logging(false);
     emulator
@@ -620,11 +634,12 @@ fn apply_core_options(emulator: &mut Emulator) {
     crate::diagnostics::set_enabled(options.diagnostics_enabled, emulator);
     update_diagnostic_audio_buffer_status(crate::diagnostics::is_enabled());
     log::info!(
-        "Core options applied: volume={} repeat_delay={} repeat_period={} swap_ab={} diagnostics={} unknown_instruction={:?} cpu_engine={}",
+        "Core options applied: volume={} repeat_delay={} repeat_period={} swap_ab={} frame_rate_enhancement={} diagnostics={} unknown_instruction={:?} cpu_engine={}",
         options.volume,
         options.repeat_delay,
         options.repeat_period,
         options.swap_ab,
+        options.frame_rate_enhancement_enabled,
         options.diagnostics_enabled,
         options.unknown_instruction_policy,
         if options.jit_enabled { "jit" } else { "interpreter" }
@@ -877,6 +892,30 @@ mod tests {
                 (key == c"dingooemu_swap_ab").then(|| "enabled".to_string())
             })
             .swap_ab
+        );
+    }
+
+    #[test]
+    fn frame_rate_enhancement_option_defaults_to_disabled() {
+        let variables = core_option_variables();
+        let variable = variables
+            .iter()
+            .find(|variable| {
+                !variable.key.is_null()
+                    && unsafe { CStr::from_ptr(variable.key) }
+                        == c"dingooemu_frame_rate_enhancement"
+            })
+            .unwrap();
+        assert!(unsafe { CStr::from_ptr(variable.value) }
+            .to_str()
+            .unwrap()
+            .starts_with("Frame Rate Enhancement; disabled"));
+        assert!(!read_core_options(|_| None).frame_rate_enhancement_enabled);
+        assert!(
+            read_core_options(|key| {
+                (key == c"dingooemu_frame_rate_enhancement").then(|| "enabled".to_string())
+            })
+            .frame_rate_enhancement_enabled
         );
     }
 
