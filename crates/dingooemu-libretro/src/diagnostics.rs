@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -145,9 +146,9 @@ impl DiagnosticSession {
     fn report(&self, jit: JitDiagnostics) -> String {
         let total = self.total;
         let recent = self.recent;
-        format!(
+        let mut report = format!(
             "DingooEmu performance diagnostics\n\
-format_version=5\n\
+format_version=7\n\
 core_version={}\n\
 target_os={}\n\
 target_arch={}\n\
@@ -210,8 +211,19 @@ jit_compilation_failures={}\n\
 jit_compilation_total_us={}\n\
 jit_compilation_max_us={}\n\
 jit_cold_fallbacks={}\n\
+jit_unavailable_fallbacks={}\n\
+jit_cache_capacity_fallbacks={}\n\
+jit_below_hot_threshold_fallbacks={}\n\
+jit_compile_budget_fallbacks={}\n\
+jit_block_too_short_fallbacks={}\n\
+jit_unsupported_instruction_fallbacks={}\n\
+jit_failed_block_fallbacks={}\n\
 jit_instruction_limit_fallbacks={}\n\
-jit_zero_exit_fallbacks={}\n",
+jit_zero_exit_fallbacks={}\n\
+jit_slow_memory_exits={}\n\
+jit_fast_cache_hits={}\n\
+jit_map_cache_hits={}\n\
+jit_fast_cache_collisions={}\n",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -266,9 +278,43 @@ jit_zero_exit_fallbacks={}\n",
             jit.compilation_total_us,
             jit.compilation_max_us,
             jit.cold_fallbacks,
+            jit.unavailable_fallbacks,
+            jit.cache_capacity_fallbacks,
+            jit.below_hot_threshold_fallbacks,
+            jit.compile_budget_fallbacks,
+            jit.block_too_short_fallbacks,
+            jit.unsupported_instruction_fallbacks,
+            jit.failed_block_fallbacks,
             jit.instruction_limit_fallbacks,
             jit.zero_exit_fallbacks,
+            jit.slow_memory_exits,
+            jit.fast_cache_hits,
+            jit.map_cache_hits,
+            jit.fast_cache_collisions,
+        );
+        writeln!(
+            report,
+            "jit_failed_hotspot_count={}",
+            jit.failed_hotspot_count
         )
+        .expect("writing diagnostics to a String cannot fail");
+        for (index, hotspot) in jit.failed_hotspots[..jit.failed_hotspot_count]
+            .iter()
+            .enumerate()
+        {
+            writeln!(
+                report,
+                "jit_failed_hotspot_{}=0x{:08x},{},{},0x{:08x},{}",
+                index,
+                hotspot.start,
+                hotspot.reason.as_str(),
+                hotspot.candidate_len,
+                hotspot.blocking_instruction,
+                hotspot.fallbacks
+            )
+            .expect("writing diagnostics to a String cannot fail");
+        }
+        report
     }
 
     fn write_report(&mut self, jit: JitDiagnostics) {
@@ -459,7 +505,7 @@ mod tests {
 
         let report = std::fs::read_to_string(directory.join(DIAGNOSTIC_FILE_NAME)).unwrap();
         for expected in [
-            "format_version=5",
+            "format_version=7",
             "content=test.app",
             "frames=1",
             "tick_max_us=12345",
@@ -478,6 +524,10 @@ mod tests {
             "async_audio_enabled=false",
             "jit_native_executions=7",
             "jit_zero_exit_fallbacks=0",
+            "jit_below_hot_threshold_fallbacks=0",
+            "jit_slow_memory_exits=0",
+            "jit_fast_cache_collisions=0",
+            "jit_failed_hotspot_count=0",
         ] {
             assert!(
                 report.contains(expected),

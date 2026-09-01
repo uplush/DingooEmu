@@ -53,6 +53,39 @@ pub struct UnknownHleCall {
     pub first_arguments: [u32; 4],
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JitFailureReason {
+    #[default]
+    None,
+    BlockTooShort,
+    UnsupportedInstruction,
+    UnsupportedBranch,
+    UnsupportedDelaySlot,
+}
+
+impl JitFailureReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::BlockTooShort => "block_too_short",
+            Self::UnsupportedInstruction => "unsupported_instruction",
+            Self::UnsupportedBranch => "unsupported_branch",
+            Self::UnsupportedDelaySlot => "unsupported_delay_slot",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitFailedBlockHotspot {
+    pub start: u32,
+    pub reason: JitFailureReason,
+    pub candidate_len: u8,
+    pub blocking_instruction: u32,
+    pub fallbacks: u64,
+}
+
+pub const JIT_FAILED_HOTSPOT_LIMIT: usize = 16;
+
 /// Aggregated native translation counters for performance diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JitDiagnostics {
@@ -72,8 +105,21 @@ pub struct JitDiagnostics {
     pub compilation_total_us: u64,
     pub compilation_max_us: u64,
     pub cold_fallbacks: u64,
+    pub unavailable_fallbacks: u64,
+    pub cache_capacity_fallbacks: u64,
+    pub below_hot_threshold_fallbacks: u64,
+    pub compile_budget_fallbacks: u64,
+    pub block_too_short_fallbacks: u64,
+    pub unsupported_instruction_fallbacks: u64,
+    pub failed_block_fallbacks: u64,
     pub instruction_limit_fallbacks: u64,
     pub zero_exit_fallbacks: u64,
+    pub slow_memory_exits: u64,
+    pub fast_cache_hits: u64,
+    pub map_cache_hits: u64,
+    pub fast_cache_collisions: u64,
+    pub failed_hotspot_count: usize,
+    pub failed_hotspots: [JitFailedBlockHotspot; JIT_FAILED_HOTSPOT_LIMIT],
 }
 
 fn hook_filter_location(address: u32) -> (usize, u64) {

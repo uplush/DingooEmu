@@ -1,5 +1,7 @@
 use crate::cpu::Registers;
-use crate::emulator::JitDiagnostics;
+use crate::emulator::{
+    JitDiagnostics, JitFailedBlockHotspot, JitFailureReason, JIT_FAILED_HOTSPOT_LIMIT,
+};
 use cranelift::codegen::ir::{
     types, AbiParam, Function, InstBuilder, MemFlagsData, Signature, Value,
 };
@@ -15,10 +17,16 @@ use std::time::Instant;
 
 const HOT_BLOCK_THRESHOLD: u16 = 256;
 const MIN_COMPILED_BLOCK_LEN: usize = 4;
+const MIN_HOT_SHORT_BLOCK_LEN: usize = 2;
+const SHORT_BLOCK_HOT_THRESHOLD: u16 = 4_096;
 const MAX_JIT_CACHE_ENTRIES: usize = 32_768;
-const FAST_JIT_CACHE_SLOTS: usize = 4_096;
+const FAST_JIT_CACHE_SLOTS: usize = 16_384;
 const MAX_ZERO_INSTRUCTION_EXITS: u8 = 4;
 const COMPILE_COOLDOWN_FRAMES: u8 = 3;
+const COMPILE_FAST_MAX_US: u128 = 1_500;
+const COMPILE_MODERATE_MAX_US: u128 = 3_000;
+const COMPILE_SLOW_MAX_US: u128 = 6_000;
+const COMPILE_EXPENSIVE_COOLDOWN_FRAMES: u8 = 5;
 const REGISTER_COUNT: usize = 34;
 const HI_INDEX: usize = 32;
 const LO_INDEX: usize = 33;
@@ -42,6 +50,10 @@ struct FastJitCacheEntry {
 struct JitCacheEntry {
     hits: u16,
     failed: bool,
+    failure_reason: JitFailureReason,
+    candidate_len: u8,
+    blocking_instruction: u32,
+    failed_fallbacks: u64,
     zero_instruction_exits: u8,
     block: Option<CompiledBlock>,
 }
@@ -58,8 +70,19 @@ struct JitCounters {
     compilation_total_us: u64,
     compilation_max_us: u64,
     cold_fallbacks: u64,
+    unavailable_fallbacks: u64,
+    cache_capacity_fallbacks: u64,
+    below_hot_threshold_fallbacks: u64,
+    compile_budget_fallbacks: u64,
+    block_too_short_fallbacks: u64,
+    unsupported_instruction_fallbacks: u64,
+    failed_block_fallbacks: u64,
     instruction_limit_fallbacks: u64,
     zero_exit_fallbacks: u64,
+    slow_memory_exits: u64,
+    fast_cache_hits: u64,
+    map_cache_hits: u64,
+    fast_cache_collisions: u64,
 }
 
 #[derive(Default)]
@@ -140,6 +163,29 @@ impl JitEngine {
     }
 
     pub(crate) fn diagnostics(&self) -> JitDiagnostics {
+        let mut failed_hotspots = [JitFailedBlockHotspot::default(); JIT_FAILED_HOTSPOT_LIMIT];
+        let mut failed_hotspot_count = 0usize;
+        for (&start, entry) in self.entries.iter().filter(|(_, entry)| entry.failed) {
+            let hotspot = JitFailedBlockHotspot {
+                start,
+                reason: entry.failure_reason,
+                candidate_len: entry.candidate_len,
+                blocking_instruction: entry.blocking_instruction,
+                fallbacks: entry.failed_fallbacks,
+            };
+            let insert_at = failed_hotspots[..failed_hotspot_count]
+                .iter()
+                .position(|current| hotspot.fallbacks > current.fallbacks)
+                .unwrap_or(failed_hotspot_count);
+            if insert_at < JIT_FAILED_HOTSPOT_LIMIT {
+                let new_count = (failed_hotspot_count + 1).min(JIT_FAILED_HOTSPOT_LIMIT);
+                if insert_at + 1 < new_count {
+                    failed_hotspots.copy_within(insert_at..new_count - 1, insert_at + 1);
+                }
+                failed_hotspots[insert_at] = hotspot;
+                failed_hotspot_count = new_count;
+            }
+        }
         JitDiagnostics {
             feature_available: true,
             enabled: self.enabled,
@@ -161,8 +207,21 @@ impl JitEngine {
             compilation_total_us: self.counters.compilation_total_us,
             compilation_max_us: self.counters.compilation_max_us,
             cold_fallbacks: self.counters.cold_fallbacks,
+            unavailable_fallbacks: self.counters.unavailable_fallbacks,
+            cache_capacity_fallbacks: self.counters.cache_capacity_fallbacks,
+            below_hot_threshold_fallbacks: self.counters.below_hot_threshold_fallbacks,
+            compile_budget_fallbacks: self.counters.compile_budget_fallbacks,
+            block_too_short_fallbacks: self.counters.block_too_short_fallbacks,
+            unsupported_instruction_fallbacks: self.counters.unsupported_instruction_fallbacks,
+            failed_block_fallbacks: self.counters.failed_block_fallbacks,
             instruction_limit_fallbacks: self.counters.instruction_limit_fallbacks,
             zero_exit_fallbacks: self.counters.zero_exit_fallbacks,
+            slow_memory_exits: self.counters.slow_memory_exits,
+            fast_cache_hits: self.counters.fast_cache_hits,
+            map_cache_hits: self.counters.map_cache_hits,
+            fast_cache_collisions: self.counters.fast_cache_collisions,
+            failed_hotspot_count,
+            failed_hotspots,
         }
     }
 
@@ -281,6 +340,8 @@ impl JitEngine {
         if !self.enabled || instruction_limit == 0 || self.compiler.is_none() {
             if DIAGNOSTICS {
                 self.counters.cold_fallbacks = self.counters.cold_fallbacks.saturating_add(1);
+                self.counters.unavailable_fallbacks =
+                    self.counters.unavailable_fallbacks.saturating_add(1);
             }
             return None;
         }
@@ -289,6 +350,9 @@ impl JitEngine {
         let fast_entry = self.fast_entries[fast_index];
         if fast_entry.start == start {
             if let Some(block) = fast_entry.block {
+                if DIAGNOSTICS {
+                    self.counters.fast_cache_hits = self.counters.fast_cache_hits.saturating_add(1);
+                }
                 let completed =
                     execute_compiled_block(block, instruction_limit, registers, ram, framebuffer);
                 if let Some(completed) = completed {
@@ -298,6 +362,10 @@ impl JitEngine {
                                 self.counters.native_executions.saturating_add(1);
                             self.counters.native_instructions =
                                 self.counters.native_instructions.saturating_add(completed);
+                            if completed < block.instruction_count as u64 {
+                                self.counters.slow_memory_exits =
+                                    self.counters.slow_memory_exits.saturating_add(1);
+                            }
                         }
                         return Some(completed);
                     }
@@ -320,6 +388,9 @@ impl JitEngine {
                 }
                 return None;
             }
+        } else if DIAGNOSTICS && fast_entry.block.is_some() {
+            self.counters.fast_cache_collisions =
+                self.counters.fast_cache_collisions.saturating_add(1);
         }
 
         let at_capacity = self.entries.len() >= MAX_JIT_CACHE_ENTRIES;
@@ -330,6 +401,8 @@ impl JitEngine {
                     if DIAGNOSTICS {
                         self.counters.cold_fallbacks =
                             self.counters.cold_fallbacks.saturating_add(1);
+                        self.counters.cache_capacity_fallbacks =
+                            self.counters.cache_capacity_fallbacks.saturating_add(1);
                     }
                     return None;
                 }
@@ -338,6 +411,9 @@ impl JitEngine {
         };
 
         if let Some(block) = entry.block {
+            if DIAGNOSTICS {
+                self.counters.map_cache_hits = self.counters.map_cache_hits.saturating_add(1);
+            }
             self.fast_entries[fast_index] = FastJitCacheEntry {
                 start,
                 block: Some(block),
@@ -364,6 +440,10 @@ impl JitEngine {
                         self.counters.native_executions.saturating_add(1);
                     self.counters.native_instructions =
                         self.counters.native_instructions.saturating_add(completed);
+                    if completed < block.instruction_count as u64 {
+                        self.counters.slow_memory_exits =
+                            self.counters.slow_memory_exits.saturating_add(1);
+                    }
                 }
                 return Some(completed);
             }
@@ -376,27 +456,66 @@ impl JitEngine {
         if entry.failed {
             if DIAGNOSTICS {
                 self.counters.cold_fallbacks = self.counters.cold_fallbacks.saturating_add(1);
+                self.counters.failed_block_fallbacks =
+                    self.counters.failed_block_fallbacks.saturating_add(1);
+                entry.failed_fallbacks = entry.failed_fallbacks.saturating_add(1);
             }
             return None;
         }
 
         entry.hits = entry.hits.saturating_add(1);
-        if entry.hits < HOT_BLOCK_THRESHOLD || self.compile_budget == 0 {
+        if entry.hits < HOT_BLOCK_THRESHOLD {
             if DIAGNOSTICS {
                 self.counters.cold_fallbacks = self.counters.cold_fallbacks.saturating_add(1);
+                self.counters.below_hot_threshold_fallbacks = self
+                    .counters
+                    .below_hot_threshold_fallbacks
+                    .saturating_add(1);
             }
             return None;
         }
-        if candidate_instruction_count(instructions) < MIN_COMPILED_BLOCK_LEN {
-            entry.failed = true;
+        if self.compile_budget == 0 {
             if DIAGNOSTICS {
                 self.counters.cold_fallbacks = self.counters.cold_fallbacks.saturating_add(1);
+                self.counters.compile_budget_fallbacks =
+                    self.counters.compile_budget_fallbacks.saturating_add(1);
+            }
+            return None;
+        }
+        let candidate = analyze_candidate(instructions);
+        let candidate_count = candidate.instruction_count;
+        if candidate_count < MIN_HOT_SHORT_BLOCK_LEN {
+            entry.failed = true;
+            entry.failure_reason = candidate.failure_reason;
+            entry.candidate_len = u8::try_from(candidate_count).unwrap_or(u8::MAX);
+            entry.blocking_instruction = candidate.blocking_instruction;
+            entry.failed_fallbacks = 1;
+            if DIAGNOSTICS {
+                self.counters.cold_fallbacks = self.counters.cold_fallbacks.saturating_add(1);
+                if candidate_count == 0 {
+                    self.counters.unsupported_instruction_fallbacks = self
+                        .counters
+                        .unsupported_instruction_fallbacks
+                        .saturating_add(1);
+                } else {
+                    self.counters.block_too_short_fallbacks =
+                        self.counters.block_too_short_fallbacks.saturating_add(1);
+                }
+            }
+            return None;
+        }
+        if candidate_count < MIN_COMPILED_BLOCK_LEN && entry.hits < SHORT_BLOCK_HOT_THRESHOLD {
+            if DIAGNOSTICS {
+                self.counters.cold_fallbacks = self.counters.cold_fallbacks.saturating_add(1);
+                self.counters.below_hot_threshold_fallbacks = self
+                    .counters
+                    .below_hot_threshold_fallbacks
+                    .saturating_add(1);
             }
             return None;
         }
 
         self.compile_budget = 0;
-        self.compile_cooldown = COMPILE_COOLDOWN_FRAMES;
         let compile_start = Instant::now();
         let compile_result = self
             .compiler
@@ -404,6 +523,7 @@ impl JitEngine {
             .expect("compiler presence checked above")
             .compile(start, instructions);
         let compile_elapsed = compile_start.elapsed();
+        self.compile_cooldown = compile_cooldown_frames(compile_elapsed);
         if DIAGNOSTICS {
             let elapsed_us = u64::try_from(compile_elapsed.as_micros()).unwrap_or(u64::MAX);
             self.counters.compilation_attempts =
@@ -436,6 +556,10 @@ impl JitEngine {
                                 self.counters.native_executions.saturating_add(1);
                             self.counters.native_instructions =
                                 self.counters.native_instructions.saturating_add(completed);
+                            if completed < block.instruction_count as u64 {
+                                self.counters.slow_memory_exits =
+                                    self.counters.slow_memory_exits.saturating_add(1);
+                            }
                         }
                         Some(completed)
                     }
@@ -492,26 +616,79 @@ fn execute_compiled_block(
     Some(completed)
 }
 
-fn candidate_instruction_count(instructions: &[u32]) -> usize {
+#[derive(Clone, Copy)]
+struct CandidateAnalysis {
+    instruction_count: usize,
+    failure_reason: JitFailureReason,
+    blocking_instruction: u32,
+}
+
+fn compile_cooldown_frames(elapsed: std::time::Duration) -> u8 {
+    let elapsed_us = elapsed.as_micros();
+    if elapsed_us <= COMPILE_FAST_MAX_US {
+        1
+    } else if elapsed_us <= COMPILE_MODERATE_MAX_US {
+        2
+    } else if elapsed_us <= COMPILE_SLOW_MAX_US {
+        COMPILE_COOLDOWN_FRAMES
+    } else {
+        COMPILE_EXPENSIVE_COOLDOWN_FRAMES
+    }
+}
+
+fn analyze_candidate(instructions: &[u32]) -> CandidateAnalysis {
     let mut index = 0;
     while index < instructions.len() {
         let instruction = instructions[index];
         if is_control_flow(instruction) {
-            return if index + 1 < instructions.len()
-                && is_supported_delay_instruction(instructions[index + 1])
-                && lowerable_branch(instruction)
+            if !lowerable_branch(instruction) {
+                return CandidateAnalysis {
+                    instruction_count: index,
+                    failure_reason: JitFailureReason::UnsupportedBranch,
+                    blocking_instruction: instruction,
+                };
+            }
+            if index + 1 >= instructions.len()
+                || !is_supported_delay_instruction(instructions[index + 1])
             {
-                index + 2
-            } else {
-                index
+                return CandidateAnalysis {
+                    instruction_count: index,
+                    failure_reason: JitFailureReason::UnsupportedDelaySlot,
+                    blocking_instruction: instructions.get(index + 1).copied().unwrap_or(0),
+                };
+            }
+            return CandidateAnalysis {
+                instruction_count: index + 2,
+                failure_reason: if index + 2 < MIN_COMPILED_BLOCK_LEN {
+                    JitFailureReason::BlockTooShort
+                } else {
+                    JitFailureReason::None
+                },
+                blocking_instruction: 0,
             };
         }
         if !is_memory_instruction(instruction) && !is_supported_register_instruction(instruction) {
-            return index;
+            return CandidateAnalysis {
+                instruction_count: index,
+                failure_reason: JitFailureReason::UnsupportedInstruction,
+                blocking_instruction: instruction,
+            };
         }
         index += 1;
     }
-    index
+    CandidateAnalysis {
+        instruction_count: index,
+        failure_reason: if index < MIN_COMPILED_BLOCK_LEN {
+            JitFailureReason::BlockTooShort
+        } else {
+            JitFailureReason::None
+        },
+        blocking_instruction: 0,
+    }
+}
+
+fn candidate_instruction_count(instructions: &[u32]) -> usize {
+    analyze_candidate(instructions).instruction_count
 }
 
 fn lowerable_branch(instruction: u32) -> bool {
@@ -604,6 +781,7 @@ impl Compiler {
     }
 }
 
+#[derive(Clone)]
 struct LoweringState {
     registers: Value,
     ram: Value,
@@ -640,10 +818,27 @@ fn lower_block(
                 break;
             }
             let branch_pc = start.wrapping_add((index as u32).wrapping_mul(4));
+            let pre_branch_state = state.clone();
             let Some(target) = lower_branch(builder, state, instruction, branch_pc) else {
                 break;
             };
-            if !lower_register_instruction(builder, state, instructions[index + 1]) {
+            let delay_instruction = instructions[index + 1];
+            if is_memory_instruction(delay_instruction) {
+                if !lower_memory_instruction(
+                    builder,
+                    state,
+                    delay_instruction,
+                    branch_pc.wrapping_add(4),
+                    (index + 1) as u64,
+                    Some(SlowMemoryExit {
+                        state: &pre_branch_state,
+                        pc: branch_pc,
+                        completed: index as u64,
+                    }),
+                ) {
+                    break;
+                }
+            } else if !lower_register_instruction(builder, state, delay_instruction) {
                 break;
             }
             index += 2;
@@ -653,7 +848,7 @@ fn lower_block(
 
         if is_memory_instruction(instruction) {
             let pc = start.wrapping_add((index as u32).wrapping_mul(4));
-            if !lower_memory_instruction(builder, state, instruction, pc, index as u64) {
+            if !lower_memory_instruction(builder, state, instruction, pc, index as u64, None) {
                 break;
             }
         } else if !lower_register_instruction(builder, state, instruction) {
@@ -676,8 +871,7 @@ fn is_control_flow(instruction: u32) -> bool {
 
 fn is_supported_delay_instruction(instruction: u32) -> bool {
     !is_control_flow(instruction)
-        && !is_memory_instruction(instruction)
-        && is_supported_register_instruction(instruction)
+        && (is_memory_instruction(instruction) || is_supported_register_instruction(instruction))
 }
 
 fn is_supported_register_instruction(instruction: u32) -> bool {
@@ -1126,12 +1320,20 @@ fn select_branch_target(
     builder.ins().select(condition, taken, fallthrough)
 }
 
+#[derive(Clone, Copy)]
+struct SlowMemoryExit<'a> {
+    state: &'a LoweringState,
+    pc: u32,
+    completed: u64,
+}
+
 fn lower_memory_instruction(
     builder: &mut FunctionBuilder<'_>,
     state: &mut LoweringState,
     instruction: u32,
     pc: u32,
     completed: u64,
+    slow_exit: Option<SlowMemoryExit<'_>>,
 ) -> bool {
     let opcode = instruction >> 26;
     let rs = ((instruction >> 21) & 0x1f) as usize;
@@ -1201,8 +1403,13 @@ fn lower_memory_instruction(
 
     builder.switch_to_block(slow);
     builder.seal_block(slow);
-    let bailout_pc = iconst_u32(builder, pc);
-    emit_exit(builder, state, bailout_pc, completed);
+    let slow_exit = slow_exit.unwrap_or(SlowMemoryExit {
+        state,
+        pc,
+        completed,
+    });
+    let bailout_pc = iconst_u32(builder, slow_exit.pc);
+    emit_exit(builder, slow_exit.state, bailout_pc, slow_exit.completed);
 
     builder.switch_to_block(fast);
     builder.seal_block(fast);
@@ -1513,6 +1720,45 @@ mod tests {
     }
 
     #[test]
+    fn short_blocks_compile_only_after_the_higher_hot_threshold() {
+        let start = 0x1800;
+        let instructions = [
+            (0x09 << 26) | (8 << 16) | 1,
+            (0x09 << 26) | (8 << 21) | (8 << 16) | 1,
+        ];
+        let mut engine = JitEngine::new();
+        let mut registers = Registers::new(start);
+        let mut memory = Memory::new();
+        let ram = memory.jit_ram_ptr();
+        let framebuffer = memory.jit_framebuffer_ptr();
+
+        for _ in 0..SHORT_BLOCK_HOT_THRESHOLD - 1 {
+            assert!(engine
+                .execute(
+                    start,
+                    &instructions,
+                    instructions.len(),
+                    &mut registers,
+                    ram,
+                    framebuffer,
+                )
+                .is_none());
+        }
+        assert!(engine.entries[&start].block.is_none());
+
+        let completed = engine.execute(
+            start,
+            &instructions,
+            instructions.len(),
+            &mut registers,
+            ram,
+            framebuffer,
+        );
+        assert_eq!(completed, Some(2));
+        assert!(engine.entries[&start].block.is_some());
+    }
+
+    #[test]
     fn clearing_cache_recreates_compiler_after_native_code_generation() {
         let instructions = [
             (0x09 << 26) | (8 << 16) | 1,
@@ -1593,6 +1839,96 @@ mod tests {
             jit_memory.read_u32(0x200).unwrap(),
             interpreter_memory.read_u32(0x200).unwrap()
         );
+    }
+
+    #[test]
+    fn compilation_cooldown_scales_conservatively_with_compile_time() {
+        assert_eq!(
+            compile_cooldown_frames(std::time::Duration::from_micros(1_500)),
+            1
+        );
+        assert_eq!(
+            compile_cooldown_frames(std::time::Duration::from_micros(1_501)),
+            2
+        );
+        assert_eq!(
+            compile_cooldown_frames(std::time::Duration::from_micros(3_001)),
+            3
+        );
+        assert_eq!(
+            compile_cooldown_frames(std::time::Duration::from_micros(6_001)),
+            5
+        );
+        assert_eq!(
+            compile_cooldown_frames(std::time::Duration::from_micros(20_000)),
+            5
+        );
+    }
+
+    #[test]
+    fn memory_instruction_in_branch_delay_slot_matches_interpreter() {
+        let start = 0x2000;
+        let instructions = [
+            (0x09 << 26) | (29 << 16) | 0x0200,    // addiu sp, zero, 0x200
+            (0x09 << 26) | (2 << 16) | 0x1234,     // addiu v0, zero, 0x1234
+            (0x04 << 26) | 2,                      // beq zero, zero, +2
+            (0x2b << 26) | (29 << 21) | (2 << 16), // sw v0, 0(sp) (delay slot)
+        ];
+
+        let mut compiler = Compiler::new().unwrap();
+        let block = compiler.compile(start, &instructions).unwrap().unwrap();
+        assert_eq!(block.instruction_count, instructions.len());
+
+        let mut jit_registers = Registers::new(start);
+        let mut jit_memory = Memory::new();
+        let jit_ram = jit_memory.jit_ram_ptr();
+        let jit_framebuffer = jit_memory.jit_framebuffer_ptr();
+        let completed = unsafe { (block.function)(&mut jit_registers, jit_ram, jit_framebuffer) };
+
+        let mut interpreter = Cpu::new(start);
+        let mut interpreter_memory = Memory::new();
+        interpreter.start();
+        for &instruction in &instructions {
+            assert!(interpreter
+                .step_fetched_unaccounted(instruction, &mut interpreter_memory)
+                .unwrap());
+        }
+
+        assert_eq!(completed, instructions.len() as u64);
+        assert_eq!(jit_registers.gpr, interpreter.regs.gpr);
+        assert_eq!(jit_registers.pc, interpreter.regs.pc);
+        assert_eq!(jit_memory.read_u32(0x200).unwrap(), 0x1234);
+        assert_eq!(
+            jit_memory.read_u32(0x200).unwrap(),
+            interpreter_memory.read_u32(0x200).unwrap()
+        );
+    }
+
+    #[test]
+    fn slow_memory_delay_slot_exits_before_branch_side_effects() {
+        let start = 0x2400;
+        let target = 0x2800;
+        let instructions = [
+            (0x0f << 26) | (29 << 16) | 0x1f00, // lui sp, 0x1f00 (slow address)
+            (0x09 << 26) | (2 << 16) | 0x1234,  // addiu v0, zero, 0x1234
+            (0x03 << 26) | ((target >> 2) & 0x03ff_ffff), // jal target
+            (0x2b << 26) | (29 << 21) | (2 << 16), // sw v0, 0(sp) (delay slot)
+        ];
+
+        let mut compiler = Compiler::new().unwrap();
+        let block = compiler.compile(start, &instructions).unwrap().unwrap();
+        let mut registers = Registers::new(start);
+        registers.write(31, 0xdead_beef);
+        let mut memory = Memory::new();
+        let ram = memory.jit_ram_ptr();
+        let framebuffer = memory.jit_framebuffer_ptr();
+        let completed = unsafe { (block.function)(&mut registers, ram, framebuffer) };
+
+        assert_eq!(completed, 2);
+        assert_eq!(registers.pc, start + 8);
+        assert_eq!(registers.read(31), 0xdead_beef);
+        assert_eq!(registers.read(29), 0x1f00_0000);
+        assert_eq!(registers.read(2), 0x1234);
     }
 
     #[test]
